@@ -14,6 +14,299 @@ import folder_paths
 
 script_directory = os.path.dirname(os.path.abspath(__file__))
 
+groundingdino_model_dir_name = "grounding-dino"
+groundingdino_model_list = {
+    "GroundingDINO_SwinT_OGC (694MB)": {
+        "config_url": "https://huggingface.co/ShilongLiu/GroundingDINO/resolve/main/GroundingDINO_SwinT_OGC.cfg.py",
+        "model_url": "https://huggingface.co/ShilongLiu/GroundingDINO/resolve/main/groundingdino_swint_ogc.pth",
+    },
+    "GroundingDINO_SwinB (938MB)": {
+        "config_url": "https://huggingface.co/ShilongLiu/GroundingDINO/resolve/main/GroundingDINO_SwinB.cfg.py",
+        "model_url": "https://huggingface.co/ShilongLiu/GroundingDINO/resolve/main/groundingdino_swinb_cogcoor.pth"
+    },
+}
+
+def get_local_filepath(url, dirname, local_file_name=None):
+    if not local_file_name:
+        parsed_url = urlparse(url)
+        local_file_name = os.path.basename(parsed_url.path)
+
+    destination = folder_paths.get_full_path(dirname, local_file_name)
+    if destination:
+        logger.warn(f'using extra model: {destination}')
+        return destination
+
+    folder = os.path.join(folder_paths.models_dir, dirname)
+    if not os.path.exists(folder):
+        os.makedirs(folder)
+
+    destination = os.path.join(folder, local_file_name)
+    if not os.path.exists(destination):
+        logger.warn(f'downloading {url} to {destination}')
+        download_url_to_file(url, destination)
+    return destination
+
+
+def load_groundingdino_model(model_name):
+    dino_model_args = local_groundingdino_SLConfig.fromfile(
+        get_local_filepath(
+            groundingdino_model_list[model_name]["config_url"],
+            groundingdino_model_dir_name
+        ),
+    )
+
+    if dino_model_args.text_encoder_type == 'bert-base-uncased':
+        dino_model_args.text_encoder_type = get_bert_base_uncased_model_path()
+    
+    dino = local_groundingdino_build_model(dino_model_args)
+    checkpoint = torch.load(
+        get_local_filepath(
+            groundingdino_model_list[model_name]["model_url"],
+            groundingdino_model_dir_name,
+        ),
+    )
+    dino.load_state_dict(local_groundingdino_clean_state_dict(
+        checkpoint['model']), strict=False)
+    device = comfy.model_management.get_torch_device()
+    dino.to(device=device)
+    dino.eval()
+    return dino
+
+
+def list_groundingdino_model():
+    return list(groundingdino_model_list.keys())
+
+def groundingdino_predict(
+    dino_model,
+    image,
+    prompt,
+    threshold
+):
+    def load_dino_image(image_pil):
+        transform = T.Compose(
+            [
+                T.RandomResize([800], max_size=1333),
+                T.ToTensor(),
+                T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+            ]
+        )
+        image, _ = transform(image_pil, None)  # 3, h, w
+        return image
+
+    def get_grounding_output(model, image, caption, box_threshold):
+        caption = caption.lower()
+        caption = caption.strip()
+        if not caption.endswith("."):
+            caption = caption + "."
+        device = comfy.model_management.get_torch_device()
+        image = image.to(device)
+        with torch.no_grad():
+            outputs = model(image[None], captions=[caption])
+        logits = outputs["pred_logits"].sigmoid()[0]  # (nq, 256)
+        boxes = outputs["pred_boxes"][0]  # (nq, 4)
+        # filter output
+        logits_filt = logits.clone()
+        boxes_filt = boxes.clone()
+        filt_mask = logits_filt.max(dim=1)[0] > box_threshold
+        logits_filt = logits_filt[filt_mask]  # num_filt, 256
+        boxes_filt = boxes_filt[filt_mask]  # num_filt, 4
+        return boxes_filt.cpu()
+
+    dino_image = load_dino_image(image.convert("RGB"))
+    boxes_filt = get_grounding_output(
+        dino_model, dino_image, prompt, threshold
+    )
+    H, W = image.size[1], image.size[0]
+    for i in range(boxes_filt.size(0)):
+        boxes_filt[i] = boxes_filt[i] * torch.Tensor([W, H, W, H])
+        boxes_filt[i][:2] -= boxes_filt[i][2:] / 2
+        boxes_filt[i][2:] += boxes_filt[i][:2]
+    return boxes_filt
+
+
+def sam2_segment(sam_model, image, final_box, segmentor='single_image', individual_objects=False):
+    device = sam_model["device"]
+    dtype = sam_model["dtype"]
+    model = sam_model["model"]
+    B, H, W, C = image.shape
+    image_np = (image[0].contiguous() * 255).byte().numpy()
+
+    if segmentor == 'automaskgenerator':
+        raise ValueError("For automaskgenerator use Sam2AutoMaskSegmentation -node")
+    if segmentor == 'single_image' and B > 1:
+        raise ValueError("Use video segmentor for multiple frames")
+
+    if segmentor == 'video' and final_box is not None:
+        raise ValueError("Video segmentor doesn't support bboxes")
+
+    if segmentor == 'video':
+        model_input_image_size = model.image_size
+        image = common_upscale(image.movedim(-1, 1), model_input_image_size, model_input_image_size, "bilinear", "disabled").movedim(1, -1)
+
+    mask_list = []
+
+    try:
+        model.to(device)
+    except:
+        model.model.to(device)
+
+    autocast_condition = not mm.is_device_mps(device)
+    with torch.autocast(mm.get_autocast_device(device), dtype=dtype) if autocast_condition else nullcontext():
+        if image.shape[0] == 1:
+            if segmentor == 'video':
+                raise ValueError("Video segmentor needs more than one frame")
+            model.set_image(image_np)
+            masks, scores, logits = model.predict(
+                point_coords=None,
+                point_labels=None,
+                box=final_box if final_box is not None else None,
+                multimask_output=True if not individual_objects else False,
+            )
+
+            if masks.ndim == 3:
+                sorted_ind = np.argsort(scores)[::-1]
+                masks = masks[sorted_ind][0]
+                scores = scores[sorted_ind]
+                logits = logits[sorted_ind]
+                mask_list.append(np.expand_dims(masks, axis=0))
+            else:
+                _, _, H, W = masks.shape
+                combined_mask = np.zeros((H, W), dtype=bool)
+                for mask in masks:
+                    combined_mask = np.logical_or(combined_mask, mask)
+                combined_mask = combined_mask.astype(np.uint8)
+                mask_list.append(combined_mask)
+        else:
+            if hasattr(model, 'inference_state'):
+                model.reset_state(model.inference_state)
+            model.inference_state = model.init_state(image.permute(0, 3, 1, 2).contiguous(), H, W, device=device)
+
+            if individual_objects:
+                for i in range(final_box.shape[0]):
+                    _, out_obj_ids, out_mask_logits = model.add_new_points(
+                        inference_state=model.inference_state,
+                        frame_idx=0,
+                        obj_id=i,
+                        points=None,
+                        labels=None,
+                    )
+            else:
+                _, out_obj_ids, out_mask_logits = model.add_new_points(
+                    inference_state=model.inference_state,
+                    frame_idx=0,
+                    obj_id=1,
+                    points=None,
+                    labels=None,
+                )
+
+            video_segments = {}
+            for out_frame_idx, out_obj_ids, out_mask_logits in model.propagate_in_video(model.inference_state):
+                video_segments[out_frame_idx] = {
+                    out_obj_id: (out_mask_logits[i] > 0.0).cpu().numpy()
+                    for i, out_obj_id in enumerate(out_obj_ids)
+                }
+
+                if individual_objects:
+                    _, _, H, W = out_mask_logits.shape
+                    combined_mask = np.zeros((H, W), dtype=np.uint8)
+                    for i, out_obj_id in enumerate(out_obj_ids):
+                        out_mask = (out_mask_logits[i] > 0.0).cpu().numpy()
+                        combined_mask = np.logical_or(combined_mask, out_mask)
+                    video_segments[out_frame_idx] = combined_mask
+
+            if individual_objects:
+                for frame_idx, combined_mask in video_segments.items():
+                    mask_list.append(combined_mask)
+            else:
+                for frame_idx, obj_masks in video_segments.items():
+                    for out_obj_id, out_mask in obj_masks.items():
+                        mask_list.append(out_mask)
+
+    out_list = []
+    for mask in mask_list:
+        mask_tensor = torch.from_numpy(mask)
+        mask_tensor = mask_tensor.permute(1, 2, 0)
+        mask_tensor = mask_tensor[:, :, 0]
+        out_list.append(mask_tensor)
+    mask_tensor = torch.stack(out_list, dim=0).cpu().float()
+    return mask_tensor
+
+class GroundingDinoModelLoader:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model_name": (list(groundingdino_model_list.keys()), ),
+            }
+        }
+    CATEGORY = "GroundingDINO"
+    FUNCTION = "load"
+    RETURN_TYPES = ("GROUNDING_DINO_MODEL", )
+
+    def load(self, model_name):
+        model = load_groundingdino_model(model_name)
+        return (model, )
+
+
+class GroundingDinoSAM2Segment:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "sam_model": ('SAM2_MODEL', {}),
+                "grounding_dino_model": ('GROUNDING_DINO_MODEL', {}),
+                "image": ('IMAGE', {}),
+                "prompt": ("STRING", {}),
+                "threshold": ("FLOAT", {
+                    "default": 0.3,
+                    "min": 0,
+                    "max": 1.0,
+                    "step": 0.01
+                }),
+                "keep_model_loaded": ("BOOLEAN", {"default": True}),
+            },
+            "optional": {
+                "individual_objects": ("BOOLEAN", {"default": False}),
+            }
+        }
+    CATEGORY = "Segmentation"
+    FUNCTION = "segment"
+    RETURN_TYPES = ("IMAGE", "MASK")
+
+    def segment(self, grounding_dino_model, sam_model, image, prompt, threshold, keep_model_loaded, individual_objects=False):
+        offload_device = mm.unet_offload_device()
+        
+        # Use GroundingDINO to get bounding boxes
+        boxes = groundingdino_predict(
+            grounding_dino_model,
+            Image.fromarray(np.clip(255. * image.cpu().numpy(), 0, 255).astype(np.uint8)).convert('RGBA'),
+            prompt,
+            threshold
+        )
+        
+        if boxes.shape[0] == 0:
+            _, height, width, _ = image.size()
+            empty_mask = torch.zeros((1, height, width), dtype=torch.uint8, device="cpu")
+            return (empty_mask, empty_mask)
+
+        # Perform segmentation using SAM2
+        mask_tensor = sam2_segment(
+            sam_model=sam_model,
+            image=image,
+            final_box=boxes,
+            segmentor=sam_model["segmentor"],
+            individual_objects=individual_objects
+        )
+
+        if not keep_model_loaded:
+            try:
+                sam_model.to(offload_device)
+            except:
+                sam_model["model"].to(offload_device)
+
+        return (image, mask_tensor)
+
+
 class DownloadAndLoadSAM2Model:
     @classmethod
     def INPUT_TYPES(s):
